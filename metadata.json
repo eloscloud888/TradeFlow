@@ -1,0 +1,5 @@
+{
+  "name": "TradeFlow - cTrader Automation",
+  "description": "A comprehensive trading automation platform integrating cTrader with visual strategy building, backtesting, and AI-powered chart analysis.",
+  "requestFramePermissions": []
+}

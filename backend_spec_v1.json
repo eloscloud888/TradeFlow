@@ -1,0 +1,174 @@
+{
+  "meta": {
+    "project": "TradeFlow",
+    "version": "1.0.0",
+    "description": "Backend logic specification for cTrader automation, OCR parsing, and strategy execution.",
+    "target_persona": "Senior Full-Stack Engineer / Algo-Trading Specialist"
+  },
+  "models": [
+    {
+      "name": "OHLCV",
+      "description": "Standard candlestick data point.",
+      "fields": {
+        "timestamp": "number (Unix ms UTC)",
+        "open": "number (Decimal)",
+        "high": "number (Decimal)",
+        "low": "number (Decimal)",
+        "close": "number (Decimal)",
+        "volume": "number (Decimal)"
+      },
+      "validation": "high >= low && high >= open && high >= close && low <= open && low <= close"
+    },
+    {
+      "name": "StrategyConfig",
+      "description": "User-defined strategy configuration.",
+      "fields": {
+        "id": "uuid",
+        "name": "string",
+        "symbol": "string (e.g., EURUSD)",
+        "timeframe": "string (e.g., 1h, 4h, 1d)",
+        "conditions": "ConditionNode[] (AST for boolean logic)",
+        "risk_settings": {
+          "risk_per_trade_percent": "number",
+          "max_open_positions": "integer",
+          "max_drawdown_limit": "number",
+          "fixed_lot_size": "number (optional override)"
+        },
+        "execution_mode": "enum('LIVE', 'PAPER', 'BACKTEST')"
+      }
+    },
+    {
+      "name": "Signal",
+      "description": "Output from the Rule Evaluation Engine.",
+      "fields": {
+        "strategy_id": "uuid",
+        "timestamp": "number",
+        "direction": "enum('BUY', 'SELL', 'FLAT')",
+        "confidence": "number (0-1)",
+        "metadata": "object (Triggering indicators values)"
+      }
+    },
+    {
+      "name": "OrderRequest",
+      "description": "Normalized order object before sending to cTrader.",
+      "fields": {
+        "idempotency_key": "uuid",
+        "symbol": "string",
+        "type": "enum('MARKET', 'LIMIT', 'STOP')",
+        "side": "enum('BUY', 'SELL')",
+        "volume": "number (lots)",
+        "stop_loss": "number (price)",
+        "take_profit": "number (price)",
+        "limit_price": "number (optional)"
+      }
+    }
+  ],
+  "pipelines": {
+    "ocr_ingestion": {
+      "steps": [
+        {
+          "step": 1,
+          "action": "Image Pre-processing",
+          "logic": "Convert to grayscale -> Increase contrast -> Binarize -> Detect grid lines to infer scale."
+        },
+        {
+          "step": 2,
+          "action": "Text & Shape Extraction",
+          "logic": "Use Google Vision API / Tesseract. Extract numeric axis labels. Identify candlestick bodies (green/red) and wicks."
+        },
+        {
+          "step": 3,
+          "action": "Normalization",
+          "logic": "Map pixel coordinates to price/time values based on axis interpolation."
+        },
+        {
+          "step": 4,
+          "action": "Validation",
+          "logic": "Check H>=L constraint. Detect missing candles (gaps). Normalize timezone to UTC."
+        }
+      ]
+    },
+    "indicator_engine": {
+      "implementations": [
+        {
+          "name": "SMA",
+          "signature": "sma(source: number[], period: int)",
+          "formula": "sum(source[-period:]) / period"
+        },
+        {
+          "name": "RSI",
+          "signature": "rsi(source: number[], period: int)",
+          "formula": "100 - (100 / (1 + RS)) where RS = SmoothAvgGain / SmoothAvgLoss (Wilder's Smoothing)"
+        },
+        {
+          "name": "MACD",
+          "signature": "macd(source: number[], fast: int, slow: int, signal: int)",
+          "formula": "MACD Line = EMA(fast) - EMA(slow); Signal Line = EMA(MACD Line, signal); Histogram = MACD - Signal"
+        },
+        {
+          "name": "VWAP",
+          "signature": "vwap(ohlcv: OHLCV[])",
+          "formula": "Cumulative(Volume * TypicalPrice) / Cumulative(Volume)"
+        }
+      ]
+    },
+    "rule_evaluation": {
+      "logic": "Evaluate AST (Abstract Syntax Tree). Supports nested boolean operators (AND, OR, NOT).",
+      "debounce": "Signal must persist for 'N' ticks or 'N' candles to be valid.",
+      "conflict_resolution": "If BUY and SELL signals trigger simultaneously, prioritize 'FLAT' (no action) or the signal with higher confidence score."
+    },
+    "risk_management": {
+      "position_sizing_algo": "size = (AccountBalance * RiskPercent) / (StopLossDistance * PipValue)",
+      "margin_check": "IF (FreeMargin - RequiredMargin) < 0 THEN REJECT",
+      "drawdown_check": "IF (CurrentEquity < (HighWaterMark * (1 - MaxDrawdownLimit))) THEN HALT_TRADING"
+    },
+    "execution_engine": {
+      "provider": "cTrader Open API 2.0 (Protobuf/WebSockets)",
+      "flow": [
+        "Check Risk Manager Limits",
+        "Generate Idempotency Key (UUID)",
+        "IF mode == 'LIVE': Send PROTO_OA_NEW_ORDER_REQ",
+        "IF mode == 'PAPER': Update Internal Virtual Ledger",
+        "Wait for EXECUTION_EVENT (Filled/Rejected)",
+        "Log Audit Trail"
+      ],
+      "retry_policy": "Exponential backoff (max 3 retries) on network errors. No retry on logical rejections (e.g. 'Not Enough Money')."
+    }
+  },
+  "endpoints": [
+    {
+      "method": "POST",
+      "path": "/api/v1/ingest/chart",
+      "description": "Upload image for OCR parsing.",
+      "request_body": { "image_base64": "string", "TIMEFRAME": "string" },
+      "response_body": { "ohlc_data": "OHLCV[]", "confidence_score": "number" }
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/strategy/execute",
+      "description": "Trigger a strategy execution run (dry-run or live).",
+      "request_body": { "strategy_id": "uuid", "mode": "LIVE|PAPER" },
+      "response_body": { "signal": "Signal", "order_id": "string|null" }
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/backtest/run",
+      "description": "Run historical simulation.",
+      "request_body": { "strategy_id": "uuid", "start_date": "ISO8601", "end_date": "ISO8601" },
+      "response_body": { "pnl": "number", "trades": "Trade[]", "sharpe_ratio": "number" }
+    }
+  ],
+  "security": {
+    "api_keys": "Stored in Vault/AWS Secrets Manager. Injected into runtime via Env Vars.",
+    "encryption": "AES-256 for storing user API secrets at rest. TLS 1.3 for all data in transit.",
+    "audit": "Immutable write-once logs for all trade executions."
+  },
+  "testing": {
+    "scenarios": [
+      "Ensure Buy signal is ignored if max_open_positions is reached.",
+      "Verify position sizing calculates 0 lots if risk > account balance.",
+      "Test Idempotency: Send same order UUID twice, ensure only 1 execution.",
+      "OCR: Validate rejection of charts with non-monotonic time axes."
+    ]
+  }
+}
